@@ -245,7 +245,7 @@ function Checkin-Account {
 
 # ---------------- 主流程启动 ----------------
 Write-Host "`n==========================================" -ForegroundColor DarkCyan
-Write-Host "        Trae CN 自动签到工具 (多开版)     " -ForegroundColor Cyan
+Write-Host "  Trae CN 自动签到工具 (多设备伪装版 - 带日志)     " -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor DarkCyan
 Write-Log "扫描到 $($stats.TotalAccounts) 个账号文件，准备开始签到..." "Yellow"
 Write-Host ""
