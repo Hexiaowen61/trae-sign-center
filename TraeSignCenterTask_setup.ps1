@@ -1,5 +1,5 @@
 # ==========================================
-# Trae CN 自动签到 - 计划任务配置工具
+# Trae CN 自动签到 - 计划任务配置工具 (开机触发版)
 # ==========================================
 
 # 获取当前脚本所在目录
@@ -15,7 +15,7 @@ if (-not (Test-Path $TargetScript)) {
 }
 
 $TaskName = "TraeSignCenterTask"
-$DefaultTime = "10:00" # 默认每天早上 10:00 运行
+$DefaultDelay = "3" # 默认延迟 3 分钟
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "     Trae CN 自动签到 - 计划任务配置      " -ForegroundColor Cyan
@@ -27,7 +27,7 @@ $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyConti
 
 if ($ExistingTask) {
     Write-Host "检测到已存在的任务 [$TaskName]" -ForegroundColor Yellow
-    Write-Host "  [1] 覆盖更新 (修改运行时间)"
+    Write-Host "  [1] 覆盖更新 (修改延迟时间)"
     Write-Host "  [2] 删除任务 (取消自动签到)"
     Write-Host "  [3] 退出"
     $choice = Read-Host "请选择操作 (1/2/3)"
@@ -45,25 +45,18 @@ if ($ExistingTask) {
 
 Write-Host ""
 Write-Host "当前脚本路径: $TargetScript"
-Write-Host "将配置名为 [$TaskName] 的每天定时任务。"
-Write-Host "默认每天 $DefaultTime 自动在后台运行签到。" -ForegroundColor Gray
+Write-Host "将配置名为 [$TaskName] 的开机自动签到任务。"
+Write-Host "每次开机登录后，延迟 $DefaultDelay 分钟在后台静默运行。" -ForegroundColor Gray
 Write-Host ""
 
-# 询问是否修改时间
-$newTime = Read-Host "请输入每天运行的时间 (格式 小时:分钟，直接回车保持默认 $DefaultTime)"
-if (-not [string]::IsNullOrWhiteSpace($newTime)) {
-    if ($newTime -match '^\d{1,2}:\d{2}$') {
-        $DefaultTime = $newTime
+# 询问是否修改延迟时间
+$newDelay = Read-Host "请输入开机后延迟几分钟运行 (直接回车保持默认 $DefaultDelay)"
+if (-not [string]::IsNullOrWhiteSpace($newDelay)) {
+    if ($newDelay -match '^\d+$') {
+        $DefaultDelay = $newDelay
     } else {
-        Write-Host " 时间格式输入有误，将使用默认时间 $DefaultTime" -ForegroundColor Yellow
+        Write-Host " 格式输入有误，将使用默认延迟 $DefaultDelay 分钟" -ForegroundColor Yellow
     }
-}
-
-# 尝试转换时间字符串
-try {
-    $RunTime = [datetime]::ParseExact($DefaultTime, "HH:mm", $null)
-} catch {
-    $RunTime = [datetime]::ParseExact("10:00", "HH:mm", $null)
 }
 
 Write-Host "`n正在注册计划任务..." -ForegroundColor Yellow
@@ -71,20 +64,23 @@ Write-Host "`n正在注册计划任务..." -ForegroundColor Yellow
 # 构建操作 (使用 powershell.exe 隐藏窗口运行)
 $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$TargetScript`"" -WorkingDirectory $ScriptDir
 
-# 构建触发器 (每天定时)
-$Trigger = New-ScheduledTaskTrigger -Daily -At $RunTime
+# 构建触发器 (当前用户登录时触发)
+$Trigger = New-ScheduledTaskTrigger -AtLogOn
+# 【修正点】：将延迟设置加在触发器上
+$Trigger.Delay = "PT${DefaultDelay}M"
 
-# 构建设置 (允许使用电池时运行，防止错过)
+# 构建设置 (允许使用电池时运行)
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$Settings.ExecutionTimeLimit = "PT0S" # 取消执行时间限制，防止被系统中断
 
 try {
-    # 如果之前选了覆盖，或者任务不存在，直接注册
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description "Trae CN 每日自动签到" -RunLevel Highest -Force | Out-Null
+    # 注册任务
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Description "Trae CN 开机延迟自动签到" -Force | Out-Null
 
     Write-Host "`n 计划任务配置成功！" -ForegroundColor Green
     Write-Host "任务名称: $TaskName"
-    Write-Host "运行时间: 每天 $($RunTime.ToString('HH:mm'))"
-    Write-Host "运行状态: 会在后台静默运行，不会有黑框弹出。"
+    Write-Host "触发条件: 每次开机/用户登录时"
+    Write-Host "运行状态: 登录后延迟 $DefaultDelay 分钟，在后台静默运行。"
     Write-Host ""
     Write-Host "你可以在 Windows 开始菜单搜索“任务计划程序”查看和修改它。" -ForegroundColor Gray
 
@@ -94,3 +90,4 @@ try {
 }
 
 Write-Host ""
+Pause
