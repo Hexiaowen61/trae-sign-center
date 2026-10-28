@@ -1,0 +1,5 @@
+# idea env
+.idea/*
+# tsc
+/TraeAccounts
+/TraeSignCenter.log
