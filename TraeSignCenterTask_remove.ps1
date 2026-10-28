@@ -28,3 +28,4 @@ if ($null -eq $ExistingTask) {
 }
 
 Write-Host ""
+Pause
