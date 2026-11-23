@@ -2,4 +2,4 @@
 .idea/*
 # tsc
 /TraeAccounts
-/TraeSignCenter.log
+/logs/
