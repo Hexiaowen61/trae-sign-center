@@ -79,6 +79,13 @@ function randomHex(n) {
     return crypto.randomBytes(n).toString('hex');
 }
 
+// 签到接口只认 15 位纯数字的设备ID（aha 体系），旧版生成的 hex 会被判为非法设备
+const DEVICE_ID_RE = /^\d{15}$/;
+
+function newDeviceId() {
+    return String(Math.floor(1e14 + Math.random() * 9e14));
+}
+
 function b64url(buf) {
     return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
@@ -243,13 +250,27 @@ function deviceFileFor(accountFile) {
     return accountFile.replace(/\.json$/i, '.device.json');
 }
 
+// 旧版本曾把设备信息复制进账号文件，这里统一清理：设备信息只存在于 .device.json
+const LEGACY_STORAGE_DEVICE_FIELDS = ['telemetry.devDeviceId', 'telemetry.machineId'];
+const LEGACY_EXTRA_DEVICE_FIELDS = ['deviceId', 'machineId'];
+
+function stripDeviceFields(storage) {
+    for (const key of LEGACY_STORAGE_DEVICE_FIELDS) delete storage[key];
+    if (storage.traeSignCenter) {
+        for (const key of LEGACY_EXTRA_DEVICE_FIELDS) delete storage.traeSignCenter[key];
+    }
+    return storage;
+}
+
 function loadDevice(accountFile) {
     const existing = readAccountFile(accountFile) || {};
     const extra = existing.traeSignCenter || {};
-    // 账号文件不存在时，沿用同名的 .device.json，避免被服务端识别成新设备
+    // 设备信息唯一来源于同名的 .device.json，不再回落到账号文件
     const deviceJson = readAccountFile(deviceFileFor(accountFile)) || {};
-    const deviceId = extra.deviceId || deviceJson.device_id || randomHex(16);
-    const machineId = extra.machineId || deviceJson.machine_id || randomHex(32);
+    // 旧的 hex 设备ID会被迁移为 15 位数字ID
+    let deviceId = String(deviceJson.device_id || '');
+    if (!DEVICE_ID_RE.test(deviceId)) deviceId = newDeviceId();
+    const machineId = String(deviceJson.machine_id || '') || randomHex(32);
     const keys = extra.privateKey
         ? { publicKey: extra.publicKey, privateKey: extra.privateKey }
         : generateKeyPair();
@@ -257,13 +278,10 @@ function loadDevice(accountFile) {
 }
 
 function saveAccount(accountFile, auth, device) {
+    // 账号文件只保存登录态与续期所需信息，设备字段一律不写入
     const storage = {
         'iCubeAuthInfo://icube.cloudide': encryptAuth(auth),
-        'telemetry.machineId': device.machineId,
-        'telemetry.devDeviceId': device.deviceId,
         traeSignCenter: {
-            deviceId: device.deviceId,
-            machineId: device.machineId,
             publicKey: device.keys.publicKey,
             privateKey: device.keys.privateKey,
             consoleHost: CONFIG.consoleHost,
@@ -273,6 +291,7 @@ function saveAccount(accountFile, auth, device) {
         }
     };
     writeJson(accountFile, storage);
+    // 设备信息写 .device.json，作为唯一来源
     writeJson(deviceFileFor(accountFile), {
         device_id: device.deviceId,
         machine_id: device.machineId
@@ -448,6 +467,9 @@ async function doRefresh(options) {
     const enc = storage[AUTH_KEY];
     if (!enc) throw fail('refresh', 'NO_AUTH', '账号文件中没有登录态');
     const extra = storage.traeSignCenter;
+    if (extra && extra.source === 'client') {
+        throw fail('refresh', 'CLIENT_SOURCE', '该账号登录态提取自客户端，不支持自动续期，请重新执行「4. 提取信息」');
+    }
     if (!extra || !extra.privateKey) {
         throw fail('refresh', 'NO_DEVICE_KEY', '账号文件缺少设备密钥，请通过 trae.js 菜单重新登录');
     }
@@ -459,9 +481,22 @@ async function doRefresh(options) {
     const auth = decryptAuth(enc);
     if (!auth.refreshToken) throw fail('refresh', 'NO_REFRESH', '账号文件缺少 refreshToken，请重新登录');
 
+    // 设备信息只从 .device.json 读取；缺失或为旧版 hex 时重建并写回，保证唯一来源
+    const deviceJson = readAccountFile(deviceFileFor(options.file)) || {};
+    let deviceId = String(deviceJson.device_id || '');
+    let machineId = String(deviceJson.machine_id || '');
+    let needSync = false;
+    if (!DEVICE_ID_RE.test(deviceId)) { deviceId = newDeviceId(); needSync = true; }
+    if (!machineId) { machineId = randomHex(32); needSync = true; }
+    if (needSync) {
+        const next = { device_id: deviceId, machine_id: machineId };
+        if (deviceJson.token_device_id) next.token_device_id = deviceJson.token_device_id;
+        writeJson(deviceFileFor(options.file), next);
+    }
+    // 续期要求设备ID与登录态绑定的设备一致；老账号用 token_device_id 保留登录时的设备ID
     const device = {
-        deviceId: extra.deviceId,
-        machineId: extra.machineId,
+        deviceId: String(deviceJson.token_device_id || deviceId),
+        machineId,
         keys: { publicKey: extra.publicKey, privateKey: extra.privateKey }
     };
 
@@ -470,6 +505,9 @@ async function doRefresh(options) {
         exchange = await exchangeToken('refreshToken', auth.refreshToken, '', device, device.keys, auth.token);
     } catch (e) {
         const code = String(e.code || '');
+        if (code === '20403') {
+            throw fail('refresh', code, '设备标识与登录态不匹配，请通过 trae.js 菜单重新登录');
+        }
         if (code === '20101' || code === '20324' || code === '20315' || code === '20125') {
             throw fail('refresh', code, '登录会话已失效，请通过 trae.js 菜单重新登录');
         }
@@ -487,6 +525,7 @@ async function doRefresh(options) {
 
     storage[AUTH_KEY] = encryptAuth(auth);
     storage.traeSignCenter = Object.assign({}, extra, { updatedAt: new Date().toISOString() });
+    stripDeviceFields(storage);
     writeJson(options.file, storage);
 
     return {

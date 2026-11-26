@@ -242,6 +242,161 @@ async function addAccounts() {
     }
 }
 
+// ---------------- 提取信息 ----------------
+function defaultStoragePath() {
+    return path.join(process.env.APPDATA || '', 'Trae CN', 'User', 'globalStorage', 'storage.json');
+}
+
+// 解析用户输入的登录态路径：支持 %变量%、引号、文件路径或多层目录
+function resolveStoragePath(raw) {
+    let p = (raw || '').trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+    if (!p) p = defaultStoragePath();
+    p = p.replace(/%([^%]+)%/g, (m, name) => (process.env[name] !== undefined ? process.env[name] : m));
+    p = path.resolve(p);
+
+    if (!fs.existsSync(p)) return null;
+    if (fs.statSync(p).isFile()) return /\.json$/i.test(p) ? p : null;
+
+    const candidates = [
+        path.join(p, 'User', 'globalStorage', 'storage.json'),
+        path.join(p, 'globalStorage', 'storage.json'),
+        path.join(p, 'storage.json')
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return null;
+}
+
+function normalizeAccountName(raw) {
+    return (raw || '').trim().replace(/\.device\.json$/i, '').replace(/\.json$/i, '');
+}
+
+// 从客户端登录态中取出 token、设备ID、机器码与设备密钥
+function readClientLogin(storage) {
+    const tokenBlob = storage[AUTH_KEY];
+    if (!tokenBlob) return { error: '客户端当前未登录（缺少 iCubeAuthInfo://icube.cloudide），请先在客户端登录。' };
+
+    // 设备ID藏在键名 iCubeAuthInfo://icube-dc:<数字> 里，值里是设备密钥对
+    const deviceKey = Object.keys(storage).find(k => k.startsWith('iCubeAuthInfo://icube-dc:'));
+    if (!deviceKey) return { error: '客户端登录态中没有设备信息（iCubeAuthInfo://icube-dc），请先在客户端登录。' };
+
+    const deviceId = String(deviceKey.split(':').pop()).trim();
+    const machineId = String(storage['telemetry.machineId'] || '').trim();
+    if (!machineId) return { error: '客户端登录态中缺少 telemetry.machineId，无法提取。' };
+
+    let deviceKeys = null;
+    try {
+        const dc = engine.decryptAuth(storage[deviceKey]);
+        if (dc && dc.privateKeyPEM && dc.publicKeyPEM) {
+            deviceKeys = { privateKey: dc.privateKeyPEM, publicKey: dc.publicKeyPEM };
+        }
+    } catch (e) { /* 下面统一提示 */ }
+    if (!deviceKeys) return { error: '无法解析客户端设备密钥，续期将不可用。' };
+
+    let auth = null;
+    try {
+        auth = engine.decryptAuth(tokenBlob);
+    } catch (e) { /* 下面统一提示 */ }
+    if (!auth || !auth.token) return { error: '客户端登录态无法解析，请重新登录客户端后再试。' };
+
+    return { tokenBlob, deviceId, machineId, deviceKeys, auth };
+}
+
+async function extractAccountInfo() {
+    banner('Trae CN 签到助手 - 提取信息');
+
+    const fallbackPath = defaultStoragePath();
+    console.log('');
+    const pathInput = await ask(`  请输入客户端登录态路径（回车使用默认）:\n  ${fallbackPath}\n  > `);
+    if (rlClosed) return;
+
+    const storagePath = resolveStoragePath(pathInput);
+    if (!storagePath) {
+        fail('未找到客户端登录态文件，请检查路径（需指向 storage.json 或其上级目录）。');
+        return;
+    }
+    note(`读取来源 : ${storagePath}`);
+
+    let storage;
+    try {
+        storage = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+    } catch (e) {
+        fail('客户端登录态文件无法解析，可能已损坏。');
+        return;
+    }
+
+    const info = readClientLogin(storage);
+    if (info.error) {
+        fail(info.error);
+        return;
+    }
+    const { tokenBlob, deviceId, machineId, deviceKeys, auth } = info;
+
+    section('提取到的信息');
+    console.log(`  账号     : ${(auth.account && auth.account.username) || '未知'}`);
+    console.log(`  用户ID   : ${auth.userId || '未知'}`);
+    console.log(`  设备ID   : ${deviceId}`);
+    console.log(`  机器码   : ${machineId}`);
+    console.log(`  有效期至 : ${formatLocal(auth.expiredAt)}`);
+    if (!/^\d{15}$/.test(deviceId)) {
+        warn('设备ID不是 15 位纯数字，签到接口可能判定为非法设备（9074）。');
+    }
+    if (auth.expiredAt && new Date(auth.expiredAt).getTime() < Date.now()) {
+        warn('客户端登录态已过期，请先在客户端重新登录后再提取。');
+    }
+
+    const accounts = accountFiles().map(f => path.basename(f, '.json'));
+    const fallback = accounts.length > 0 ? accounts[0] : '号1';
+    console.log('');
+    const input = await ask(`  请输入保存名称（对应账号文件名，直接回车使用 ${fallback}）: `);
+    if (rlClosed) return;
+
+    const name = normalizeAccountName(input) || fallback;
+    if (/[\\/:*?"<>|]/.test(name)) {
+        fail('名称包含非法字符 \\ / : * ? " < > |，已取消。');
+        return;
+    }
+
+    const accountFile = path.join(DATA_DIR, `${name}.json`);
+    const deviceFile = path.join(DATA_DIR, `${name}.device.json`);
+    const existing = [accountFile, deviceFile].filter(f => fs.existsSync(f));
+    if (existing.length > 0) {
+        const list = existing.map(f => path.basename(f)).join('、');
+        const answer = await ask(`  ${list} 已存在，是否覆盖？(y/N): `);
+        if (rlClosed) return;
+        if (!/^y/i.test(answer)) {
+            warn('已取消，未做任何修改。');
+            return;
+        }
+    }
+
+    // 设备信息：token 与本设备同源，无需 token_device_id
+    fs.writeFileSync(deviceFile, JSON.stringify({ device_id: deviceId, machine_id: machineId }, null, 2) + '\n', 'utf8');
+
+    // 账号信息：原样沿用客户端登录态 + 客户端设备密钥，续期时可与登录态匹配
+    const accountStorage = {
+        [AUTH_KEY]: tokenBlob,
+        traeSignCenter: {
+            publicKey: deviceKeys.publicKey,
+            privateKey: deviceKeys.privateKey,
+            consoleHost: engine.CONFIG.consoleHost,
+            apiHost: engine.CONFIG.apiHost,
+            clientId: engine.CONFIG.clientId,
+            source: 'client',
+            extractedFrom: storagePath,
+            extractedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        }
+    };
+    fs.writeFileSync(accountFile, JSON.stringify(accountStorage, null, 2), 'utf8');
+
+    ok(`已保存 : TraeAccounts\\${name}.json（登录态与设备密钥）`);
+    ok(`已保存 : TraeAccounts\\${name}.device.json（设备ID与机器码）`);
+    note('该账号直接沿用客户端登录态，无需在浏览器中登录。');
+    warn('与客户端共用同一登录态：任一方续期都会刷新令牌，另一方需重新提取。');
+}
+
 // ---------------- 签到 ----------------
 async function apiPost(url, token, region, deviceId, machineId) {
     const headers = {
@@ -269,20 +424,56 @@ async function apiPost(url, token, region, deviceId, machineId) {
     }
 }
 
+// 签到接口只认 15 位纯数字的设备ID（aha 体系），旧版 hex 会被判为非法设备
+const DEVICE_ID_RE = /^\d{15}$/;
+
+function newDeviceId() {
+    return String(Math.floor(1e14 + Math.random() * 9e14));
+}
+
 function readDevice(fileName) {
     const deviceFile = path.join(DATA_DIR, fileName.replace(/\.json$/i, '.device.json'));
+
+    let deviceId = '';
+    let machineId = '';
+    let tokenDeviceId = '';
     if (fs.existsSync(deviceFile)) {
         try {
             const data = JSON.parse(fs.readFileSync(deviceFile, 'utf8'));
             if (data.device_id && data.machine_id) {
-                return { deviceId: String(data.device_id), machineId: String(data.machine_id), created: false };
+                deviceId = String(data.device_id);
+                machineId = String(data.machine_id);
+                tokenDeviceId = String(data.token_device_id || '');
             }
         } catch (e) { /* 损坏则重建 */ }
     }
-    const deviceId = String(Math.floor(100000000 + Math.random() * 900000000));
-    const machineId = randomHex(32);
-    fs.writeFileSync(deviceFile, JSON.stringify({ device_id: deviceId, machine_id: machineId }, null, 2) + '\n', 'utf8');
-    return { deviceId, machineId, created: true };
+
+    // 没有可用设备信息：新建
+    if (!deviceId || !machineId) {
+        const newId = newDeviceId();
+        const newMachine = randomHex(32);
+        fs.writeFileSync(deviceFile, JSON.stringify({ device_id: newId, machine_id: newMachine }, null, 2) + '\n', 'utf8');
+        return { deviceId: newId, machineId: newMachine, created: true, migrated: false };
+    }
+
+    // 旧版 hex 设备ID：迁移为 15 位数字ID（幂等，machine_id 原样复用）
+    if (!DEVICE_ID_RE.test(deviceId)) {
+        const migratedId = newDeviceId();
+        const next = { device_id: migratedId, machine_id: machineId };
+        // 登录态绑定的仍是旧设备ID，续期时要用它，否则会返回 20403
+        next.token_device_id = tokenDeviceId || deviceId;
+        fs.writeFileSync(deviceFile, JSON.stringify(next, null, 2) + '\n', 'utf8');
+        return { deviceId: migratedId, machineId, created: false, migrated: true };
+    }
+
+    return { deviceId, machineId, created: false, migrated: false };
+}
+
+function logClientSourceHint(storage) {
+    const from = (storage.traeSignCenter && storage.traeSignCenter.extractedFrom) || '';
+    log('  ! 该账号登录态提取自客户端，脚本不自动续期', yellow);
+    log('  ! 请在 Trae CN 客户端保持登录，然后重新执行「4. 提取信息」', yellow);
+    if (from) log(`    来源路径 : ${from}`, gray);
 }
 
 async function checkAccount(file, stats, index, total) {
@@ -310,9 +501,23 @@ async function checkAccount(file, stats, index, total) {
             return;
         }
 
-        // Token 到期前 12 小时自动续期
+        // 提取自客户端的账号：不自动续期，避免轮换掉客户端的 refreshToken
+        const isClientSource = (storage.traeSignCenter && storage.traeSignCenter.source) === 'client';
         const expireAt = auth.expiredAt ? new Date(auth.expiredAt).getTime() : 0;
-        if (expireAt && expireAt < Date.now() + 12 * 3600 * 1000) {
+
+        if (isClientSource && expireAt && expireAt <= Date.now()) {
+            log('  -> 登录态已过期（提取自客户端），跳过本次签到', red);
+            logClientSourceHint(storage);
+            stats.failed++;
+            return;
+        }
+        if (isClientSource && expireAt && expireAt < Date.now() + 12 * 3600 * 1000) {
+            log('  -> 登录态即将过期（提取自客户端，脚本不自动续期）', yellow);
+            logClientSourceHint(storage);
+        }
+
+        // Token 到期前 12 小时自动续期（提取自客户端的账号不在此列）
+        if (!isClientSource && expireAt && expireAt < Date.now() + 12 * 3600 * 1000) {
             log('  -> Token 即将过期，正在自动续期...', yellow);
             try {
                 await engine.doRefresh({ file });
@@ -329,6 +534,9 @@ async function checkAccount(file, stats, index, total) {
         const device = readDevice(fileName);
         if (device.created) {
             log(`  -> [新建] 已生成独立设备标识: ${fileName}`, yellow);
+        }
+        if (device.migrated) {
+            log('  -> [迁移] 设备标识已升级为 15 位数字ID', yellow);
         }
 
         const status = await apiPost(`${API_BASE}/status`, token, region, device.deviceId, device.machineId);
@@ -361,7 +569,11 @@ async function checkAccount(file, stats, index, total) {
         if (!status.enable) {
             log(`  -> 签到不可用: ${status.message || '未返回原因'}`, red);
             if (/authenticate/i.test(String(status.message || ''))) {
-                log('  -> 登录态已被服务端吊销，请在菜单中重新登录该账号。', yellow);
+                if (isClientSource) {
+                    log('  -> 该账号登录态由客户端维护，请重新执行「4. 提取信息」。', yellow);
+                } else {
+                    log('  -> 登录态已被服务端吊销，请在菜单中重新登录该账号。', yellow);
+                }
             }
             stats.failed++;
             return;
@@ -385,8 +597,10 @@ async function checkAccount(file, stats, index, total) {
         } else {
             const message = (claim && claim.message) || '未知错误';
             log(`  -> 签到失败: ${message}`, red);
-            if (/9074|too many|参与用户太多|今日已签到/i.test(message)) {
-                log('  -> 提示：服务端限流或风控，可稍后重试', yellow);
+            if (/9074|参与用户太多/i.test(message)) {
+                log('  -> 提示：设备ID非法或未被识别，请确认同目录 .device.json 的 device_id 为 15 位纯数字', yellow);
+            } else if (/9095|今日已签到/i.test(message)) {
+                log('  -> 提示：该设备今日已签到，明日再来', yellow);
             } else {
                 log('  -> 提示：可稍后在客户端确认账号状态', yellow);
             }
@@ -542,6 +756,7 @@ function renderMenu() {
     console.log('  1. 添加账号');
     console.log('  2. 立即签到');
     console.log('  3. 开机自动签到');
+    console.log('  4. 提取信息（账号+设备）');
     console.log('  0. 退出');
     console.log('');
 }
@@ -549,7 +764,7 @@ function renderMenu() {
 async function menu() {
     while (true) {
         renderMenu();
-        const choice = await ask('  请选择 [0-3]: ');
+        const choice = await ask('  请选择 [0-4]: ');
         if (rlClosed) break;
         if (choice === '0' || choice === 'q') break;
 
@@ -559,8 +774,10 @@ async function menu() {
             await runCheckin();
         } else if (choice === '3') {
             await taskMenu();
+        } else if (choice === '4') {
+            await extractAccountInfo();
         } else {
-            warn('无效选项，请输入 0、1、2 或 3。');
+            warn('无效选项，请输入 0、1、2、3 或 4。');
             continue;
         }
     }
